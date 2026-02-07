@@ -1,4 +1,4 @@
-obj-m = xpad.o
+obj-m = xpad_flydigi.o
 
 KVERSION = $(shell uname -r)
 all:

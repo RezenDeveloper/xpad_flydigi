@@ -61,6 +61,10 @@
  * Later changes can be tracked in SCM.
  */
 
+#include "linux/dev_printk.h"
+#include "linux/device.h"
+#include "linux/printk.h"
+#include "linux/sysfs.h"
 #include <linux/bits.h>
 #include <linux/kernel.h>
 #include <linux/input.h>
@@ -753,6 +757,50 @@ struct xpad_output_packet {
 	bool pending;
 };
 
+#define FLAG_FLYDIGI_DEVICE BIT(7)
+#define FLYDIGI_PKT_LEN 15
+#define FLAG_DISCONNECTING BIT(31)
+#define FLYDIGI_PKT(...) { .data = { __VA_ARGS__ } }
+#define CHECK_U8(x) ((x) >= 0 && (x) <= 255)
+#define CLAMP(v, lo, hi) min(max(v, lo), hi)
+#define XPAD_FLYDIGI_SLOT (XPAD_NUM_OUT_PACKETS - 1)
+
+struct flydigi_packet {
+	u8 data[FLYDIGI_PKT_LEN];
+};
+
+enum flydigi_trigger_side : u8 {
+  FLYDIGI_LEFT = 0x00,
+  FLYDIGI_RIGHT = 0x01,
+};
+
+enum flydigi_trigger_mode : u8 {
+  FLYDIGI_TRIGGER_DEFAULT = 0x00,
+  FLYDIGI_TRIGGER_RACE = 0x01,
+  FLYDIGI_TRIGGER_RECOIL = 0x02,
+  FLYDIGI_TRIGGER_SNIPER = 0x03,
+  FLYDIGI_TRIGGER_LOCK = 0x04,
+  FLYDIGI_TRIGGER_VIB = 0x05,
+};
+
+struct flydigi_trigger_params {
+  enum flydigi_trigger_side side;
+  enum flydigi_trigger_mode mode;
+  u8 param1;
+  u8 param2;
+  u8 param3;
+  u8 param4;
+  u8 param5;
+};
+
+struct flydigi_seq {
+  u8 packets[8][FLYDIGI_PKT_LEN];
+  u8 count;
+  u8 index;
+  struct usb_xpad *xpad;
+  struct delayed_work work;
+};
+
 #define XPAD_OUT_CMD_IDX	0
 #define XPAD_OUT_FF_IDX		1
 #define XPAD_OUT_LED_IDX	(1 + IS_ENABLED(CONFIG_JOYSTICK_XPAD_FF))
@@ -785,6 +833,12 @@ struct usb_xpad {
 	int last_out_packet;
 	int init_seq;
 
+	// Flydigi
+	u8 flags;
+	u8 flydigi_out_ep;
+	struct flydigi_trigger_params flydigi_trigger;
+	struct flydigi_seq flydigi_seq;
+
 #if defined(CONFIG_JOYSTICK_XPAD_LEDS)
 	struct xpad_led *led;
 #endif
@@ -807,6 +861,7 @@ static void xpad_deinit_input(struct usb_xpad *xpad);
 static int xpad_start_input(struct usb_xpad *xpad);
 static void xpadone_ack_mode_report(struct usb_xpad *xpad, u8 seq_num);
 static void xpad360w_poweroff_controller(struct usb_xpad *xpad);
+int flydigi_apply_trigger(struct usb_xpad *xpad, const struct flydigi_trigger_params *p);
 
 /*
  *	xpad_process_packet
@@ -1457,6 +1512,9 @@ static void xpad_stop_output(struct usb_xpad *xpad)
 			usb_kill_anchored_urbs(&xpad->irq_out_anchor);
 		}
 	}
+	if (xpad->flags & FLAG_FLYDIGI_DEVICE) {
+		usb_kill_anchored_urbs(&xpad->irq_out_anchor);
+	}
 }
 
 static void xpad_deinit_output(struct usb_xpad *xpad)
@@ -2061,6 +2119,402 @@ err_free_input:
 	return error;
 }
 
+static void flydigi_queue_packet(struct usb_xpad *xpad, const u8 *data)
+{
+    struct xpad_output_packet *pkt;
+    unsigned long flags;
+
+    spin_lock_irqsave(&xpad->odata_lock, flags);
+
+    pkt = &xpad->out_packets[XPAD_FLYDIGI_SLOT];
+
+    memcpy(pkt->data, data, FLYDIGI_PKT_LEN);
+    pkt->len = FLYDIGI_PKT_LEN;
+    pkt->pending = true;
+
+    xpad_try_sending_next_out_packet(xpad);
+
+    spin_unlock_irqrestore(&xpad->odata_lock, flags);
+}
+
+static bool xpad_is_flydigi(struct usb_device *udev)
+{
+	char manufacturer[64];
+	int ret;
+
+	if (!udev->descriptor.iManufacturer)
+		return false;
+
+	ret = usb_string(udev, udev->descriptor.iManufacturer,
+			 manufacturer, sizeof(manufacturer));
+	if (ret < 7)
+		return false;
+
+	if (strncasecmp(manufacturer, "Flydigi", 7) == 0)
+		return true;
+
+	return false;
+}
+
+static void flydigi_int_complete(struct urb *urb)
+{
+	u8 *buf = urb->context;
+
+	usb_unanchor_urb(urb);
+
+	if (urb->status)
+		pr_debug("flydigi urb status=%d\n", urb->status);
+
+	kfree(buf);
+	usb_free_urb(urb);
+}
+
+static int flydigi_send_now(struct usb_xpad *xpad, const u8 *data)
+{
+	struct urb *urb;
+	u8 *buf;
+	int i, ret;
+
+	if (!usb_get_intf(xpad->intf))
+    	return -ENODEV;
+
+	if (unlikely(xpad->flags & FLAG_DISCONNECTING)) {
+		usb_put_intf(xpad->intf);
+		return -ENODEV;
+	}
+
+	if (!xpad->irq_out) {
+		usb_put_intf(xpad->intf);
+		return -ENODEV;
+	}
+
+	urb = usb_alloc_urb(0, GFP_ATOMIC);
+	if (!urb) {
+		usb_put_intf(xpad->intf);
+		return -ENOMEM;
+	}
+
+	buf = kmemdup(data, FLYDIGI_PKT_LEN, GFP_ATOMIC);
+	if (!buf) {
+		usb_free_urb(urb);
+		usb_put_intf(xpad->intf);
+		return -ENOMEM;
+	}
+
+	dev_dbg(&xpad->intf->dev, "flydigi_send_now buffer: ");
+	print_hex_dump_debug("  ",
+						DUMP_PREFIX_OFFSET,
+						16, 1,
+						buf,
+						FLYDIGI_PKT_LEN,
+						false);
+
+	usb_fill_int_urb(
+		urb,
+		xpad->udev,
+		usb_sndintpipe(xpad->udev, xpad->flydigi_out_ep),
+		buf,
+		FLYDIGI_PKT_LEN,
+		flydigi_int_complete,
+		buf,
+		1
+	);
+
+	usb_anchor_urb(urb, &xpad->irq_out_anchor);
+	ret = usb_submit_urb(urb, GFP_ATOMIC);
+	
+	usb_put_intf(xpad->intf);
+
+	if (ret) {
+		usb_unanchor_urb(urb);
+		kfree(buf);
+		usb_free_urb(urb);
+	}
+
+	return ret;
+}
+
+static void flydigi_send_work(struct work_struct *work)
+{
+    struct flydigi_seq *seq =
+        container_of(to_delayed_work(work), struct flydigi_seq, work);
+    struct usb_xpad *xpad = READ_ONCE(seq->xpad);
+
+    if (!xpad)
+        return;
+
+    if (unlikely(xpad->flags & FLAG_DISCONNECTING) || seq->index >= seq->count) {
+        WRITE_ONCE(seq->xpad, NULL);
+        return;
+    }
+
+	print_hex_dump_debug("flydigi queued: ",
+        DUMP_PREFIX_OFFSET,
+        16, 1,
+        seq->packets[seq->index],
+        FLYDIGI_PKT_LEN,
+        false);
+
+	flydigi_queue_packet(xpad, seq->packets[seq->index]);
+    seq->index++;
+
+    if (seq->index < seq->count) {
+        mod_delayed_work(system_wq, &seq->work, msecs_to_jiffies(8));
+	}
+}
+
+static ssize_t flydigi_raw_bin_write(struct file *filp, struct kobject *kobj, const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{
+  struct device *dev = container_of(kobj, struct device, kobj);
+  struct usb_interface *intf = to_usb_interface(dev);
+  struct usb_xpad *xpad = usb_get_intfdata(intf);
+
+  if (!xpad)
+    return -ENODEV;
+
+  if (off != 0)
+    return -EINVAL;
+
+  if (count != FLYDIGI_PKT_LEN)
+    return -EINVAL;
+
+  if (!(xpad->flags & FLAG_DISCONNECTING)) {
+    flydigi_send_now(xpad, buf);
+    dev_dbg(&xpad->intf->dev, "flydigi_raw_bin sent %zu bytes\n", count);
+  }
+
+  return count;
+}
+
+static struct bin_attribute flydigi_raw_bin = {
+    .attr = {
+        .name = "flydigi_raw",
+        .mode = 0220,
+    },
+    .size  = FLYDIGI_PKT_LEN,
+    .write = flydigi_raw_bin_write,
+};
+
+static ssize_t flydigi_trigger_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct usb_interface *intf = to_usb_interface(dev);
+    struct usb_xpad *xpad = usb_get_intfdata(intf);
+    struct flydigi_trigger_params p;
+
+	if (!xpad)
+		return -ENODEV;
+
+	char kbuf[64];
+
+	if (count >= sizeof(kbuf))
+		return -EINVAL;
+
+	memcpy(kbuf, buf, count);
+	kbuf[count] = '\0';
+
+	int side, mode;
+	int p1, p2, p3, p4, p5;
+
+    if (sscanf(kbuf, "%d %d %d %d %d %d %d",
+           &side, &mode,
+           &p1, &p2, &p3, &p4, &p5) != 7)
+		return -EINVAL;
+
+	if (!CHECK_U8(side) ||
+		!CHECK_U8(mode) ||
+		!CHECK_U8(p1) ||
+		!CHECK_U8(p2) ||
+		!CHECK_U8(p3) ||
+		!CHECK_U8(p4) ||
+		!CHECK_U8(p5))
+		return -ERANGE;
+
+	p.side   = (u8)side;
+	p.mode   = (u8)mode;
+	p.param1 = (u8)p1;
+	p.param2 = (u8)p2;
+	p.param3 = (u8)p3;
+	p.param4 = (u8)p4;
+	p.param5 = (u8)p5;
+
+	if (p.side != FLYDIGI_LEFT && p.side != FLYDIGI_RIGHT)
+		return -EINVAL;
+
+	switch (p.mode) {
+	case FLYDIGI_TRIGGER_DEFAULT:
+		memset(&p.param1, 0, 5);
+		break;
+
+	case FLYDIGI_TRIGGER_RACE:
+		p.param1 = CLAMP(p.param1, 0, 192);
+		p.param2 = CLAMP(p.param2, 1, 255);
+		memset(&p.param3, 0, 3);
+		break;
+
+	case FLYDIGI_TRIGGER_RECOIL:
+		p.param1 = CLAMP(p.param1, 0, 192);
+		p.param2 = CLAMP(p.param2, 1, 255);
+		p.param3 = CLAMP(p.param3, 1, 255);
+		p.param4 = CLAMP(p.param4, 1, 255);
+		p.param5 = CLAMP(p.param5, 0, 1);
+		break;
+
+	case FLYDIGI_TRIGGER_SNIPER:
+		p.param1 = CLAMP(p.param1, 0, 192);
+		p.param2 = CLAMP(p.param2, 1, 255);
+		p.param3 = CLAMP(p.param3, 1, 255);
+		p.param4 = CLAMP(p.param4, 0, 1);
+		p.param5 = 0;
+		break;
+
+	case FLYDIGI_TRIGGER_LOCK:
+		p.param1 = CLAMP(p.param1, 0, 192);
+		p.param2 = 0xFF;
+		p.param3 = 0x01;
+		memset(&p.param4, 0, 2);
+		break;
+
+	case FLYDIGI_TRIGGER_VIB:
+		p.param1 = CLAMP(p.param1, 0, 200);
+		p.param2 = CLAMP(p.param2, 1, 255);
+		p.param3 = CLAMP(p.param3, 1, 200);
+		p.param4 = CLAMP(p.param4, 1, 255);
+		p.param5 = 0;
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	xpad->flydigi_trigger = p;
+
+    dev_dbg(&xpad->intf->dev, "params set: side=%d mode=%d p1=%d p2=%d p3=%d p4=%d p5=%d\n",
+            p.side, p.mode, p.param1, p.param2, p.param3, p.param4, p.param5);
+
+    if (!(xpad->flags & FLAG_DISCONNECTING)) {
+        flydigi_apply_trigger(xpad, &p);
+    }
+
+    return count;
+}
+
+static DEVICE_ATTR_WO(flydigi_trigger);
+
+static void flydigi_build_trigger_packet(struct flydigi_packet *pkt, const struct flydigi_trigger_params *p)
+{
+	memset(pkt->data, 0, FLYDIGI_PKT_LEN);
+
+	pkt->data[0] = 0xA5;
+	pkt->data[1] = 0x30;
+	if(p->mode == FLYDIGI_TRIGGER_VIB) {
+		pkt->data[2] = 0x08;
+		pkt->data[3] = p->side == FLYDIGI_LEFT ? 0x01 : 0x02;
+		pkt->data[4] = 0x02;
+		pkt->data[5] = p->param2;
+		pkt->data[6] = p->param1;
+		pkt->data[7] = p->param3;
+		pkt->data[8] = 0x01;
+		pkt->data[9] = 0x01;
+		pkt->data[10] = p->param4;
+	} else {
+		pkt->data[2] = 0x06;
+		pkt->data[3] = 0x00;
+		pkt->data[4] = p->side == FLYDIGI_LEFT ? 0x01 : 0x02;
+		pkt->data[5] = p->mode;
+		pkt->data[6] = p->param1;
+		pkt->data[7] = p->param2;
+		pkt->data[8] = p->param3;
+		pkt->data[9] = p->param4;
+		pkt->data[10] = p->param5;
+	}
+}
+
+int flydigi_apply_trigger(struct usb_xpad *xpad, const struct flydigi_trigger_params *p)
+{
+	struct flydigi_seq *seq = &xpad->flydigi_seq;
+	struct flydigi_packet pkt;
+	
+	if (unlikely(xpad->flags & FLAG_DISCONNECTING))
+	    return -ENODEV;
+
+	cancel_delayed_work_sync(&seq->work);
+
+	int ret = 0;
+	
+	seq->count = 0;
+	seq->index = 0;
+
+	if (seq->count >= ARRAY_SIZE(seq->packets)) {
+    	ret = -EINVAL;
+		goto out_clear;
+	}
+
+	if(p->mode == FLYDIGI_TRIGGER_VIB) {
+		struct flydigi_trigger_params clear_p = {};
+		clear_p.side = p->side;
+		clear_p.mode = FLYDIGI_TRIGGER_DEFAULT;
+
+		flydigi_build_trigger_packet(&pkt, &clear_p);
+		
+		if (seq->count >= ARRAY_SIZE(seq->packets)) {
+			ret = -EINVAL;
+			goto out_clear;
+		}
+		memcpy(seq->packets[seq->count++], pkt.data, FLYDIGI_PKT_LEN);
+	}
+
+	flydigi_build_trigger_packet(&pkt, p);
+	
+	if (seq->count >= ARRAY_SIZE(seq->packets)) {
+    	ret = -EINVAL;
+		goto out_clear;
+	}
+	memcpy(seq->packets[seq->count++], pkt.data, FLYDIGI_PKT_LEN);
+
+	WRITE_ONCE(seq->xpad, xpad);
+	schedule_delayed_work(&seq->work, 0);
+
+	out_clear:
+
+  	return ret;
+}
+
+static int xpad_create_sysfs(struct usb_xpad *xpad, struct device_attribute *device)
+{
+	int ret;
+	ret = device_create_file(&xpad->intf->dev, device);
+
+	if (ret) {
+		dev_err(&xpad->intf->dev,
+				"Failed to create %s sysfs file: %d\n", device->attr.name, ret);
+		return ret;
+	}
+	dev_info(&xpad->intf->dev,
+			"Flydigi sysfs attribute created at: %s/%s\n",
+				dev_name(&xpad->intf->dev),
+				device->attr.name);
+
+	return ret;
+}
+
+static int xpad_create_bin(struct usb_xpad *xpad, struct bin_attribute *device)
+{
+	int ret;
+	ret = sysfs_create_bin_file(&xpad->intf->dev.kobj, &flydigi_raw_bin);
+
+	if (ret) {
+		dev_err(&xpad->intf->dev,
+				"Failed to create %s sysfs file: %d\n", device->attr.name, ret);
+		return ret;
+	}
+	dev_info(&xpad->intf->dev,
+			"Flydigi sysfs attribute created at: %s/%s\n",
+				dev_name(&xpad->intf->dev),
+				device->attr.name);
+
+	return ret;
+}
+
 static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
@@ -2095,6 +2549,16 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	if (!xpad->irq_in) {
 		error = -ENOMEM;
 		goto err_free_idata;
+	}
+
+	if (xpad_is_flydigi(udev)) {
+		xpad->flags |= FLAG_FLYDIGI_DEVICE;
+		dev_info(&udev->dev, "Flydigi controller detected, enabling trigger support");
+
+		INIT_DELAYED_WORK(&xpad->flydigi_seq.work, flydigi_send_work);
+		xpad->flydigi_seq.xpad = NULL;
+		xpad->flydigi_seq.count = 0;
+		xpad->flydigi_seq.index = 0;
 	}
 
 	xpad->udev = udev;
@@ -2168,6 +2632,38 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 			 xpad, ep_irq_in->bInterval);
 	xpad->irq_in->transfer_dma = xpad->idata_dma;
 	xpad->irq_in->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+
+	if (xpad->flags & FLAG_FLYDIGI_DEVICE) {
+		struct usb_host_interface *alt = intf->cur_altsetting;
+		int i;
+
+		xpad->flydigi_out_ep = 0;
+
+		for (i = 0; i < alt->desc.bNumEndpoints; i++) {
+			struct usb_endpoint_descriptor *ep =
+				&alt->endpoint[i].desc;
+
+			if (usb_endpoint_is_int_out(ep)) {
+				xpad->flydigi_out_ep =
+					usb_endpoint_num(ep);
+				break;
+			}
+		}
+
+		if (!xpad->flydigi_out_ep) {
+			dev_err(&intf->dev,
+				"Flydigi: no interrupt OUT endpoint found\n");
+			error = -ENODEV;
+			goto err_deinit_output;
+		}
+
+		dev_dbg(&intf->dev,
+			"Flydigi interrupt OUT endpoint: %u\n",
+			xpad->flydigi_out_ep);
+
+		xpad_create_bin(xpad, &flydigi_raw_bin);
+		xpad_create_sysfs(xpad, &dev_attr_flydigi_trigger);
+	}
 
 	usb_set_intfdata(intf, xpad);
 
@@ -2243,6 +2739,25 @@ err_free_mem:
 static void xpad_disconnect(struct usb_interface *intf)
 {
 	struct usb_xpad *xpad = usb_get_intfdata(intf);
+	int i;
+	
+	if (xpad->flags & FLAG_FLYDIGI_DEVICE) {
+		xpad->flags |= FLAG_DISCONNECTING;
+		
+		if (xpad->flydigi_seq.xpad) {
+			cancel_delayed_work_sync(&xpad->flydigi_seq.work);
+			xpad->flydigi_seq.xpad = NULL;
+		}
+
+		device_remove_bin_file(&xpad->intf->dev, &flydigi_raw_bin);
+		device_remove_file(&xpad->intf->dev, &dev_attr_flydigi_trigger);		
+
+		spin_lock_irq(&xpad->odata_lock);
+		for (i = 0; i < XPAD_NUM_OUT_PACKETS; i++)
+			xpad->out_packets[i].pending = false;
+		spin_unlock_irq(&xpad->odata_lock);
+
+	}
 
 	if (xpad->xtype == XTYPE_XBOX360W)
 		xpad360w_stop_input(xpad);
@@ -2326,7 +2841,7 @@ static int xpad_resume(struct usb_interface *intf)
 }
 
 static struct usb_driver xpad_driver = {
-	.name		= "xpad",
+	.name		= "xpad_flydigi",
 	.probe		= xpad_probe,
 	.disconnect	= xpad_disconnect,
 	.suspend	= xpad_suspend,
